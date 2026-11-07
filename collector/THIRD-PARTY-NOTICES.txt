@@ -1,7 +1,11 @@
 Vion Collector by tomeeli
 https://github.com/den4m3/Vion
 
-The Python source has no third-party runtime Python dependencies.
+Optional DNS-SD discovery uses python-zeroconf (LGPL-2.1-or-later)
+and ifaddr (MIT). Core collection still works if discovery is unavailable.
+https://github.com/python-zeroconf/python-zeroconf
+https://github.com/p-stieber/ifaddr
+Install from requirements.txt. Dependency license texts are shipped in dependency-licenses/.
 The standalone Windows executable bundles Python and standard-library components.
 
 Python: Python Software Foundation License, see LICENSE-Python.txt.

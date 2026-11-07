@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import zipfile
 
-FILES = ['collector.py', 'artwork.py', 'test_artwork.py', 'config.example.json', 'README.md', 'test_collector.py',
+FILES = ['setup_web.py', 'test_setup_web.py', 'Install-Windows.ps1', 'Install-NAS.sh', 'Install-VPS.sh', 'Show-Setup-Key.cmd', 'QUICKSTART.txt', 'windows_gui.py', 'discovery.py', 'test_discovery.py', 'requirements.txt', 'Find-Vion.cmd', 'compose.discovery.yaml', 'collector.py', 'artwork.py', 'test_artwork.py', 'config.example.json', 'README.md', 'test_collector.py',
          'Start-Collector.cmd', 'Show-Key.cmd', 'Dockerfile', 'compose.yaml',
          'vion-collector.service', 'Caddyfile.example', '.dockerignore',
          'THIRD-PARTY-NOTICES.txt', 'LICENSE-Python.txt']
@@ -13,6 +13,7 @@ FILES = ['collector.py', 'artwork.py', 'test_artwork.py', 'config.example.json',
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exe', type=Path)
+    parser.add_argument('--gui-exe', type=Path)
     parser.add_argument('--out', type=Path, default=Path('dist'))
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
@@ -22,8 +23,12 @@ def main():
         with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:
             for name in FILES:
                 archive.write(root / name, name)
+            for license_file in sorted((root / 'dependency-licenses').glob('*')):
+                archive.write(license_file, 'dependency-licenses/' + license_file.name)
             if platform == 'Windows-x64':
                 archive.write(args.exe, 'VionCollector.exe')
+                if args.gui_exe:
+                    archive.write(args.gui_exe, 'VionCollectorGUI.exe')
     lines = []
     for name in ['VionCollector-Server.zip'] + (['VionCollector-Windows-x64.zip'] if args.exe else []):
         lines.append(hashlib.sha256((args.out / name).read_bytes()).hexdigest() + '  ' + name)

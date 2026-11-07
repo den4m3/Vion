@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vion metadata collector by tomeeli. Python 3.10+, no runtime dependencies.
+"""Vion metadata collector by tomeeli. Python 3.10+; optional mDNS via python-zeroconf.
 
 Only public film metadata is retained. No magnet, torrent or playback URLs.
 """
@@ -22,7 +22,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
 from artwork import ArtworkCache, IMAGE_HOSTS
 
-VERSION = '0.2.1'
+VERSION = '0.3.0'
 SOURCES = ('rutor', 'rutracker', 'kinozal', 'nnm-club', 'selezen')
 LIMIT = 8 * 1024 * 1024
 LABELS = ['', 'WEB-DL 1080p', 'BDRip 1080p', 'BDRip-HEVC 1080p',
@@ -41,6 +41,7 @@ def atomic(path, value):
         raise ValueError('snapshot_too_large')
     tmp = path.with_suffix('.tmp')
     with tmp.open('wb') as out:
+        os.chmod(tmp, 0o600)
         out.write(data)
         out.flush()
         os.fsync(out.fileno())
@@ -274,6 +275,7 @@ class Collector:
         self.update_lock = threading.Lock()
         self.error = ''
         self.artwork_ready = threading.Event()
+        self.refresh_requested = threading.Event()
         keyfile = self.data / 'access-key.txt'
         try:
             with keyfile.open('x', encoding='ascii') as out:
@@ -374,6 +376,8 @@ class Collector:
 
 
 def make_server(collector, host, port):
+    from setup_web import Setup
+    setup = Setup(collector)
     class Handler(BaseHTTPRequestHandler):
         server_version = 'VionCollector/' + VERSION
         sys_version = ''
@@ -396,6 +400,8 @@ def make_server(collector, host, port):
             self.wfile.write(body)
 
         def do_GET(self):
+            if setup.handle(self):
+                return
             if self.path == '/health':
                 return self.answer(200, dict(service='vion-collector', version=VERSION, schema=1))
             if self.path.startswith('/v1/images/'):
@@ -424,6 +430,19 @@ def make_server(collector, host, port):
                 return self.answer(200, snapshot) if snapshot else self.answer(503, dict(error='catalog_not_ready'))
             except Exception:
                 return self.answer(503, dict(error='catalog_unavailable'))
+        def do_POST(self):
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 16384:
+                    raise ValueError()
+                self.setup_body = self.rfile.read(length)
+                if len(self.setup_body) != length:
+                    raise ValueError()
+            except (ValueError, OSError):
+                return self.answer(400, dict(message='Недопустимый размер запроса.'))
+            if not setup.handle(self):
+                self.answer(404, dict(error='not_found'))
+
     class Server(ThreadingHTTPServer):
         daemon_threads = True
         def __init__(self, *args):
@@ -454,11 +473,33 @@ def main():
     parser.add_argument('--port', type=int, default=8790)
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--show-key', action='store_true')
+    parser.add_argument('--show-setup-key', action='store_true', help='Show the separate browser administration key')
+    parser.add_argument('--discover', action='store_true', help='Find Vion devices on the local network and exit')
+    parser.add_argument('--control-stdin', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--no-discovery', action='store_true', help='Disable LAN announcements and discovery')
     args = parser.parse_args()
+    if args.discover:
+        from discovery import discover
+        try:
+            rows = discover()
+        except ImportError:
+            print('LAN discovery requires: python -m pip install -r requirements.txt')
+            return 1
+        except Exception:
+            print('LAN discovery unavailable. Check multicast and firewall; manual addresses still work.')
+            return 1
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        if not rows:
+            print('No Vion devices found. Open Vion on the same LAN; allow mDNS UDP 5353.')
+        return 0
     if not Path(args.config).exists():
         atomic(Path(args.config), dict(source='rutor', interval_minutes=120, pages_per_update=2))
     config_at(args.config)
     collector = Collector(args.data, args.config)
+    if args.show_setup_key:
+        from setup_web import Setup
+        print(Setup(collector).key)
+        return 0
     if args.show_key:
         print(collector.key)
         return 0
@@ -474,7 +515,8 @@ def main():
                 delay = config_at(args.config)['interval_minutes'] * 60
             except Exception:
                 delay = 900
-            stop.wait(delay)
+            collector.refresh_requested.wait(delay)
+            collector.refresh_requested.clear()
     server = make_server(collector, args.host, args.port)
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
@@ -491,14 +533,39 @@ def main():
     threading.Thread(target=artwork_worker, daemon=True, name='VionPosters').start()
     def shutdown(*_):
         stop.set()
+        collector.refresh_requested.set()
         threading.Thread(target=server.shutdown, daemon=True).start()
+    if args.control_stdin:
+        def control():
+            import sys
+            for line in sys.stdin:
+                if line.strip() == 'stop':
+                    shutdown()
+                    return
+            shutdown()  # GUI disappeared: do not leave an orphan worker.
+        threading.Thread(target=control, daemon=True, name='VionControl').start()
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+    discovery = None
+    if not args.no_discovery:
+        try:
+            from discovery import Discovery
+            def found(item):
+                destination = item.get('url', ', '.join(item['addresses']))
+                print(f"Vion found: {item['name']} [{item['kind']}] — {destination}", flush=True)
+            discovery = Discovery(server.server_port, args.host, notify=found).start()
+        except ImportError:
+            print('LAN discovery unavailable: install requirements.txt; manual addresses still work.', flush=True)
+        except Exception:
+            print('LAN discovery unavailable; manual addresses still work.', flush=True)
     print(f'Vion Collector {VERSION} by tomeeli — {args.host}:{server.server_port}', flush=True)
+    print('Browser setup: open /setup on this server. Show the admin key with --show-setup-key (or Show-Setup-Key.cmd).', flush=True)
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
         stop.set()
+        if discovery:
+            discovery.close()
         server.server_close()
         thread.join(timeout=2)
     return 0

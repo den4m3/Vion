@@ -1,7 +1,9 @@
 FROM python:3.12-slim
 RUN groupadd --gid 10001 vion && useradd --uid 10001 --gid vion --no-create-home vion && mkdir /data && chown vion:vion /data
 WORKDIR /app
-COPY collector.py artwork.py /app/
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+COPY collector.py artwork.py discovery.py setup_web.py /app/
 USER 10001:10001
 VOLUME /data
 EXPOSE 8790

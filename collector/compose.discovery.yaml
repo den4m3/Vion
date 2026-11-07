@@ -1,0 +1,5 @@
+# Linux NAS/VPS on the same LAN: multicast requires host networking.
+services:
+  vion-collector:
+    network_mode: host
+    ports: !reset []

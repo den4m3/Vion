@@ -3,7 +3,7 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "8790:8790"
+      - "${VION_BIND_ADDRESS:-0.0.0.0}:8790:8790"
     volumes:
       - vion-data:/data
     read_only: true
