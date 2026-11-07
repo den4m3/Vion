@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import zipfile
 
-FILES = ['collector.py', 'config.example.json', 'README.md', 'test_collector.py',
+FILES = ['collector.py', 'artwork.py', 'test_artwork.py', 'config.example.json', 'README.md', 'test_collector.py',
          'Start-Collector.cmd', 'Show-Key.cmd', 'Dockerfile', 'compose.yaml',
          'vion-collector.service', 'Caddyfile.example', '.dockerignore',
          'THIRD-PARTY-NOTICES.txt', 'LICENSE-Python.txt']

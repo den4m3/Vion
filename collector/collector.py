@@ -20,8 +20,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
+from artwork import ArtworkCache, IMAGE_HOSTS
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 SOURCES = ('rutor', 'rutracker', 'kinozal', 'nnm-club', 'selezen')
 LIMIT = 8 * 1024 * 1024
 LABELS = ['', 'WEB-DL 1080p', 'BDRip 1080p', 'BDRip-HEVC 1080p',
@@ -185,6 +186,7 @@ def listing(body, source='rutor'):
             if re.fullmatch(r'/torrent/[1-9]\d*(?:/[^?#]*)?', html.unescape(href)):
                 item = item_from_title(title, published, source)
                 if item:
+                    item['_topic'] = html.unescape(href)
                     items.append(item)
                 break
     return items
@@ -205,7 +207,9 @@ def collect(config, page=1):
         base = url_base(config.get('rutor_url', 'https://rutor.info'))
         rows = []
         for category in (1, 5):
-            rows += listing(fetch(f'{base}/browse/{page - 1}/{category}/0/0'))
+            films = listing(fetch(f'{base}/browse/{page - 1}/{category}/0/0'))
+            for item in films: item['_rutor_base'] = base
+            rows += films
         return rows
     base = url_base(config.get('jackett_url', ''), private_http=True)
     secret = os.environ.get('VION_JACKETT_KEY') or config.get('jackett_key', '')
@@ -243,6 +247,13 @@ def config_at(path):
     pages = config.get('pages_per_update', 2)
     if type(pages) is not int or not 1 <= pages <= 10:
         raise ValueError('invalid_page_budget')
+    if config.get('poster_provider', 'auto') not in ('auto', 'tmdb', 'poiskkino', 'off'):
+        raise ValueError('invalid_poster_provider')
+    if config.get('poster_width', 342) not in (185, 342, 500):
+        raise ValueError('invalid_poster_width')
+    size = config.get('poster_cache_mb', 512)
+    if type(size) is not int or not 32 <= size <= 8192:
+        raise ValueError('invalid_poster_cache_limit')
     return config
 
 
@@ -251,9 +262,10 @@ class Collector:
         self.data = Path(data)
         self.data.mkdir(parents=True, exist_ok=True)
         self.config_path = Path(config_path)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.update_lock = threading.Lock()
         self.error = ''
+        self.artwork_ready = threading.Event()
         keyfile = self.data / 'access-key.txt'
         try:
             with keyfile.open('x', encoding='ascii') as out:
@@ -264,6 +276,7 @@ class Collector:
         self.key = keyfile.read_text(encoding='ascii').strip()
         if not re.fullmatch(r'[!-~]{32,512}', self.key):
             raise ValueError('invalid_access_key')
+        self.artwork = ArtworkCache(self.data, self.key)
 
     def snapshot(self, source=None):
         source = source or config_at(self.config_path)['source']
@@ -293,14 +306,15 @@ class Collector:
                 incoming += collect(config, page)
             if not incoming:
                 raise ValueError('no_qualifying_releases')
-            old = self.snapshot(config['source'])
-            result = merge(old['items'] if old else [], incoming, config['source'])
             with self.lock:
+                old = self.snapshot(config['source'])
+                result = merge(old['items'] if old else [], incoming, config['source'])
                 atomic(self.data / ('releases-' + config['source'] + '.json'), result)
                 # Save after the catalog: a crash may repeat a page, never skip it.
                 if config['source'] == 'rutor' and len(pages) > 1:
                     atomic(cursor_path, dict(page=pages[-1] + 1))
             self.error = ''
+            self.artwork_ready.set()
             return True
         except Exception as error:
             # Never log raw HTTP errors: they can contain an API key in the URL.
@@ -310,6 +324,45 @@ class Collector:
             return False
         finally:
             self.update_lock.release()
+
+    def artwork_batch(self, maximum=12):
+        config = config_at(self.config_path)
+        if config.get('poster_provider') == 'off': return 0
+        snapshot = self.snapshot(config['source'])
+        if not snapshot: return 0
+        changed = attempted = 0
+        for item in snapshot['items']:
+            # Metadata GETs never perform this work; poster downloads have their own worker.
+            ready = self.artwork.cached(item, config)
+            if ready and item.get('collectorPoster') == ready['collectorPoster']: continue
+            if not ready and not self.artwork.due(item, config): continue
+            attempted += 1
+            if not ready and not item.get('_poster_hint') and item.get('_topic') and item.get('_rutor_base'):
+                try:
+                    topic = fetch(url_base(item['_rutor_base']) + item['_topic'])
+                    start = re.search(r'<table\b[^>]*\bid=[\x22\x27]details[\x22\x27][^>]*>', topic, re.I)
+                    if start:
+                        body = re.split(r'</table>', topic[start.end():], maxsplit=1, flags=re.I)[0]
+                        body = re.split('скриншот', body, maxsplit=1, flags=re.I)[0]
+                        for value in re.findall(r'<img\b[^>]*\bsrc=[\x22\x27]([^\x22\x27]+)', body, re.I):
+                            value = html.unescape(value)
+                            if urlsplit(value).scheme == 'https' and urlsplit(value).hostname in IMAGE_HOSTS:
+                                item['_poster_hint'] = value; break
+                except Exception: pass
+            art = ready or self.artwork.enrich(item, config)
+            if art:
+                with self.lock:
+                    current = self.snapshot(config['source'])
+                    for row in current['items']:
+                        if row['id'] == item['id']: row.update(art); break
+                    current['updated'] = int(time.time() * 1000)
+                    atomic(self.data / ('releases-' + config['source'] + '.json'), current)
+                changed += 1
+            if attempted >= maximum: break
+        self.artwork.trim(config.get('poster_cache_mb', 512))
+        if attempted:
+            print(f'Posters: checked={attempted}, added={changed}; existing images retained', flush=True)
+        return attempted
 
 
 def make_server(collector, host, port):
@@ -337,6 +390,15 @@ def make_server(collector, host, port):
         def do_GET(self):
             if self.path == '/health':
                 return self.answer(200, dict(service='vion-collector', version=VERSION, schema=1))
+            if self.path.startswith('/v1/images/'):
+                body = collector.artwork.read(self.path)
+                if body is None: return self.answer(404, dict(error='image_not_found'))
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/png' if body.startswith(b'\x89PNG') else 'image/webp' if body.startswith(b'RIFF') else 'image/jpeg')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Cache-Control', 'private, max-age=604800, immutable')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.end_headers(); self.wfile.write(body); return
             supplied = self.headers.get('Authorization', '').encode('utf-8')
             expected = ('Bearer ' + collector.key).encode('ascii')
             if not hmac.compare_digest(supplied, expected):
@@ -345,6 +407,12 @@ def make_server(collector, host, port):
                 return self.answer(404, dict(error='not_found'))
             try:
                 snapshot = collector.snapshot()
+                if snapshot:
+                    for row in snapshot['items']:
+                        for field in list(row):
+                            if field.startswith('_'): del row[field]
+                        if row.get('collectorPoster') and not collector.artwork.has(row['collectorPoster']):
+                            del row['collectorPoster']
                 return self.answer(200, snapshot) if snapshot else self.answer(503, dict(error='catalog_not_ready'))
             except Exception:
                 return self.answer(503, dict(error='catalog_unavailable'))
@@ -387,7 +455,9 @@ def main():
         print(collector.key)
         return 0
     if args.once:
-        return 0 if collector.update() else 1
+        ok = collector.update()
+        if ok: collector.artwork_batch()
+        return 0 if ok else 1
     stop = threading.Event()
     def worker():
         while not stop.is_set():
@@ -400,6 +470,17 @@ def main():
     server = make_server(collector, args.host, args.port)
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
+    def artwork_worker():
+        while not stop.is_set():
+            try: attempted = collector.artwork_batch()
+            except Exception:
+                attempted = 0
+                print('Poster update delayed; saved images retained', flush=True)
+            if not attempted:
+                collector.artwork_ready.wait(300)
+                collector.artwork_ready.clear()
+            stop.wait(.25)
+    threading.Thread(target=artwork_worker, daemon=True, name='VionPosters').start()
     def shutdown(*_):
         stop.set()
         threading.Thread(target=server.shutdown, daemon=True).start()

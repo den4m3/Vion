@@ -5,5 +5,10 @@
   "rutor_url": "https://rutor.info",
   "jackett_url": "",
   "jackett_key": "",
-  "indexer": ""
+  "indexer": "",
+  "poster_provider": "auto",
+  "tmdb_key": "",
+  "poiskkino_key": "",
+  "poster_width": 342,
+  "poster_cache_mb": 512
 }
