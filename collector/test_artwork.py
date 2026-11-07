@@ -62,6 +62,20 @@ class ArtworkTests(unittest.TestCase):
         with patch.object(a, 'resolve_tmdb', side_effect=TimeoutError), patch.object(a, 'resolve_poiskkino', return_value={'url': 'https://avatars.mds.yandex.net/one.jpg', 'kpid': '2', 'provider': 'poiskkino'}), patch.object(a, 'download_image', return_value=png()):
             self.assertEqual(self.cache.enrich(film(), config)['kpid'], '2')
 
+    def test_auto_falls_back_when_first_image_download_fails(self):
+        config = dict(self.config, poster_provider='auto', poiskkino_key='private-poisk-fixture')
+        with patch.object(a, 'resolve_tmdb', return_value={'url':'https://image.tmdb.org/blocked.jpg','tmdbid':'1','provider':'tmdb'}), patch.object(a, 'resolve_poiskkino', return_value={'url':'https://avatars.mds.yandex.net/good.jpg','kpid':'2','provider':'poiskkino'}), patch.object(a, 'download_image', side_effect=[TimeoutError(), png()]):
+            result = self.cache.enrich(film(), config)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['kpid'], '2')
+
+    def test_valid_but_wrong_manifest_shape_is_recovered(self):
+        for value in ([], {'bad': None}, {'bad': {'file': '../bad', 'retry_at': 'invalid'}}):
+            self.cache.manifest.write_text(json.dumps(value), encoding='utf-8')
+            restarted = a.ArtworkCache(self.root, 'test-access-key-' + 'x' * 32)
+            self.assertTrue(restarted.due(film(), self.config))
+            self.assertIsNone(restarted.cached(film(), self.config))
+
     def test_quality_change_invalidates_lookup(self):
         self.assertNotEqual(self.cache.lookup(film(), self.config), self.cache.lookup(film(), dict(self.config, poster_width=500)))
 

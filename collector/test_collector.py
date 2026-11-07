@@ -53,6 +53,14 @@ class CollectorTests(unittest.TestCase):
         a['imdbid'], b['imdbid'] = 'tt1', 'tt2'
         self.assertEqual(len(c.merge([], [a, b], 'rutor')['items']), 2)
 
+    def test_ambiguous_title_does_not_join_conflicting_films(self):
+        a, b, unknown = film(), film(), film(rank='BDRemux 1080p')
+        a['imdbid'], b['imdbid'] = 'tt1', 'tt2'
+        result = c.merge([], [a, b, unknown], 'rutor')['items']
+        self.assertTrue(any(x.get('imdbid') == 'tt1' for x in result))
+        self.assertTrue(any(x.get('imdbid') == 'tt2' for x in result))
+        self.assertEqual(len({x['id'] for x in result}), len(result))
+
     def test_listing_dates_and_no_download_links(self):
         body = '''<div id="index"><table><tr class="gai"><td>1 янв 26</td>
         <td><a href="magnet:secret">download</a><a href="/torrent/123/film">Фильм (2026) WEB-DL 1080p</a></td>

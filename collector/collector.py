@@ -22,7 +22,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
 from artwork import ArtworkCache, IMAGE_HOSTS
 
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 SOURCES = ('rutor', 'rutracker', 'kinozal', 'nnm-club', 'selezen')
 LIMIT = 8 * 1024 * 1024
 LABELS = ['', 'WEB-DL 1080p', 'BDRip 1080p', 'BDRip-HEVC 1080p',
@@ -116,31 +116,39 @@ def conflicts(a, b):
 
 
 def merge(existing, incoming, source):
-    # Independent source files prevent a source switch from mixing two catalogs.
-    films = []
-    for item in existing + incoming:
-        item = dict(item)
-        keys = set(identities(item))
-        if not keys:
-            continue
-        matches = [f for f in films if keys.intersection(identities(f)) and not conflicts(f, item)]
+    # Index aliases once; a large saved catalog must not require pairwise comparisons.
+    films = []; active = {}; aliases = {}; positions = {}; used_ids = set()
+    def index(row, keys):
+        for key in keys: aliases.setdefault(key, {})[id(row)] = row
+    for raw in existing + incoming:
+        item = dict(raw); keys = set(identities(item))
+        if not keys: continue
+        candidates = {}
+        for key in keys: candidates.update(aliases.get(key, {}))
+        matches = sorted((row for identity, row in candidates.items() if identity in active and not conflicts(row, item)), key=lambda row: positions[id(row)])
+        if any(conflicts(left, right) for i, left in enumerate(matches) for right in matches[i+1:]):
+            strong = {key for key in keys if not key.startswith('title:')}
+            matches = [row for row in matches if strong.intersection(identities(row))]
+            if any(conflicts(left, right) for i, left in enumerate(matches) for right in matches[i+1:]): matches = []
         if not matches:
             item['id'] = item.get('id') or 'release:' + hashlib.sha256(next(iter(identities(item))).encode()).hexdigest()[:24]
-            films.append(item)
+            if item['id'] in used_ids: item['id'] = 'release:' + hashlib.sha256(encode(sorted(keys))).hexdigest()[:24]
+            films.append(item); active[id(item)] = item; positions[id(item)] = len(films); used_ids.add(item['id']); index(item, keys)
             continue
         target = matches[0]
         for other in matches[1:] + [item]:
-            for k, v in other.items():
-                if not target.get(k) and v:
-                    target[k] = v
+            keys.update(identities(other))
+            for key, value in other.items():
+                if not target.get(key) and value: target[key] = value
             target['availableQuality'] = sorted(set(target['availableQuality'] + other['availableQuality']))
             target['qualitySummary'] = ' · '.join(LABELS[x] for x in target['availableQuality'])
             target['releaseDate'] = min(target['releaseDate'], other['releaseDate'])
         for other in matches[1:]:
-            films.remove(other)
-    films.sort(key=lambda x: (x['releaseDate'], x['id']), reverse=True)
-    return dict(schema=1, updated=int(time.time() * 1000), source=source, items=films[:8000],
-                historyComplete=False, historyFrom='')
+            active.pop(id(other), None); used_ids.discard(other['id'])
+        index(target, keys | set(identities(target)))
+    films = [row for row in films if id(row) in active]
+    films.sort(key=lambda row: (row['releaseDate'], row['id']), reverse=True)
+    return dict(schema=1, updated=int(time.time() * 1000), source=source, items=films[:8000], historyComplete=False, historyFrom='')
 
 
 class NoRedirect(HTTPRedirectHandler):

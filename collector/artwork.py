@@ -4,6 +4,7 @@ import hmac
 import html
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -163,7 +164,21 @@ class ArtworkCache:
         self.secret = access_key.encode(); self.lock = threading.RLock()
         self.index = {}
         if self.manifest.exists():
-            try: self.index = json.loads(self.manifest.read_text(encoding='utf-8'))
+            try:
+                if self.manifest.stat().st_size <= 8 * 1024 * 1024:
+                    loaded = json.loads(self.manifest.read_text(encoding='utf-8'))
+                    if isinstance(loaded, dict):
+                        for key, record in loaded.items():
+                            if len(self.index) >= 16000: break
+                            if not isinstance(key, str) or len(key) > 256 or not isinstance(record, dict): continue
+                            digest = record.get('file', '')
+                            if digest and (not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest)): continue
+                            if not isinstance(record.get('ids', {}), dict): continue
+                            valid = True
+                            for field in ('checked', 'retry_at'):
+                                value = record.get(field, 0)
+                                if type(value) not in (int, float) or not math.isfinite(value) or value < 0 or value > time.time() + 86400: valid = False
+                            if valid: self.index[key] = record
             except (ValueError, OSError): pass
 
     def route(self, digest):
@@ -235,23 +250,23 @@ class ArtworkCache:
             if re.fullmatch(r'[a-f0-9]{64}', digest) and (self.root / (digest + '.img')).exists():
                 return dict(old.get('ids', {}), collectorPoster=self.route(digest))
             if time.time() < old.get('retry_at', 0): return None
-        selected = None
-        try:
-            failed = False
-            for name, secret, resolver in [('tmdb', tmdb, resolve_tmdb), ('poiskkino', poisk, resolve_poiskkino)]:
-                if not selected and provider in ('auto', name) and secret:
-                    try: selected = resolver(item, secret, width)
-                    except Exception: failed = True
-            if not selected:
-                # Rutor topic posters are allowed only from known image CDNs.
-                selected = {'url': item['_poster_hint'], 'provider': 'rutor'} if item.get('_poster_hint') else None
-            if selected:
+        record = None; failed = False
+        candidates = []
+        for name, secret, resolver in [('tmdb', tmdb, resolve_tmdb), ('poiskkino', poisk, resolve_poiskkino)]:
+            if provider in ('auto', name) and secret: candidates.append(lambda resolver=resolver, secret=secret: resolver(item, secret, width))
+        if item.get('_poster_hint'):
+            candidates.append(lambda: {'url': item['_poster_hint'], 'provider': 'rutor'})
+        for resolve in candidates:
+            try:
+                selected = resolve()
+                if not selected: continue
                 digest = self.store(download_image(selected['url']))
                 ids = {key: selected[key] for key in ('tmdbid', 'imdbid', 'kpid', 'rating', 'genres', 'description') if selected.get(key)}
                 record = dict(file=digest, ids=ids, checked=time.time(), retry_at=time.time() + 21600, provider=selected['provider'])
-            else: record = dict(checked=time.time(), retry_at=time.time() + (300 if failed else 21600))
-        except Exception:
-            record = dict(checked=time.time(), retry_at=time.time() + 300)
+                break
+            except Exception:
+                failed = True
+        if record is None: record = dict(checked=time.time(), retry_at=time.time() + (300 if failed else 21600))
         with self.lock:
             self.index[lookup] = record
             if len(self.index) > 16000:
