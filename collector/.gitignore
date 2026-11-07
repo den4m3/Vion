@@ -1,0 +1,8 @@
+data/
+config.json
+*.exe
+*.spec
+build/
+dist/
+__pycache__/
+*.pyc

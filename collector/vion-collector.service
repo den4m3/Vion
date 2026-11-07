@@ -1,0 +1,22 @@
+[Unit]
+Description=Vion metadata collector by tomeeli
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vion
+Group=vion
+WorkingDirectory=/var/lib/vion-collector
+ExecStart=/usr/bin/python3 /opt/vion-collector/collector.py --config /var/lib/vion-collector/config.json --data /var/lib/vion-collector --host 127.0.0.1 --port 8790
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vion-collector
+
+[Install]
+WantedBy=multi-user.target

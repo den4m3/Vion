@@ -1,0 +1,20 @@
+Vion Collector by tomeeli
+https://github.com/den4m3/Vion
+
+The Python source has no third-party runtime Python dependencies.
+The standalone Windows executable bundles Python and standard-library components.
+
+Python: Python Software Foundation License, see LICENSE-Python.txt.
+https://docs.python.org/3/license.html
+
+PyInstaller: GPL-2.0-or-later with bootloader exception allowing distribution
+of bundled applications under their own license. Build tool, not an added
+Python runtime dependency. License and source:
+https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt
+https://github.com/pyinstaller/pyinstaller
+
+OpenSSL (Python SSL component): Apache License 2.0.
+https://www.openssl.org/source/license.html
+
+The local build preserves the Python runtime's certificate-validation resources.
+No TLS verification is disabled. Windows binaries are not code-signed.

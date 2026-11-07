@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Vion metadata collector by tomeeli. Python 3.10+, no runtime dependencies.
+
+Only public film metadata is retained. No magnet, torrent or playback URLs.
+"""
+from __future__ import annotations
+import argparse
+from datetime import date, datetime, timedelta, timezone
+import hashlib
+import hmac
+import html
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlencode, urlsplit
+from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
+
+VERSION = '0.1.0'
+SOURCES = ('rutor', 'rutracker', 'kinozal', 'nnm-club', 'selezen')
+LIMIT = 8 * 1024 * 1024
+LABELS = ['', 'WEB-DL 1080p', 'BDRip 1080p', 'BDRip-HEVC 1080p',
+          'BDRemux 1080p', 'WEB-DL 2160p SDR', 'WEB-DL 2160p HDR',
+          'UHD BDRip SDR', 'UHD BDRip HDR', 'UHD BDRemux SDR', 'UHD BDRemux HDR']
+
+
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
+
+
+def atomic(path, value):
+    path = Path(path)
+    data = encode(value)
+    if len(data) > LIMIT:
+        raise ValueError('snapshot_too_large')
+    tmp = path.with_suffix('.tmp')
+    with tmp.open('wb') as out:
+        out.write(data)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
+
+
+def plain(value):
+    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]*>', ' ', value))).strip()
+
+
+def valid_date(value):
+    try:
+        return date.fromisoformat(str(value)[:10]).isoformat()
+    except ValueError:
+        return ''
+
+
+def quality(title):
+    s = title.upper().replace('–', '-').replace('—', '-')
+    if re.search(r'(?<![A-Z])(?:CAMRIP|HDCAM|HDTS|HDTC|TELESYNC|TS|TC|DVDSCR|SCR)(?![A-Z])', s):
+        return 0
+    uhd = bool(re.search(r'(?<!\d)2160[PI]?(?!\d)', s))
+    explicit = re.search(r'(?<!\d)(?:480|576|720|1080|1440|2160|4320)[PI]?(?!\d)', s)
+    uhd |= not explicit and bool(re.search(r'\b(?:4K|UHD)\b', s))
+    if not uhd and not re.search(r'(?<!\d)1080[PI]?(?!\d)', s):
+        return 0
+    hdr = bool(re.search(r'\bHDR(?:10\+?)?\b|DOLBY\s*VISION|\bDV\b', s))
+    if re.search(r'\bBD[ -]?REMUX\b', s):
+        return (10 if hdr else 9) if uhd else 4
+    if re.search(r'\bBD[ -]?RIP(?:\b|[-_])', s):
+        return (8 if hdr else 7) if uhd else (3 if re.search(r'HEVC|H[.]?265|X265', s) else 2)
+    if re.search(r'\bWEB[ -]?DL\b(?!RIP)', s):
+        return (6 if hdr else 5) if uhd else 1
+    return 0
+
+
+def item_from_title(title, published, source):
+    title = plain(title)[:1000]
+    published = valid_date(published)
+    rank = quality(title)
+    year = re.search(r'[\[(]((?:18|19|20|21)\d{2})[\]), ]', title)
+    if not rank or not year or not published or published > date.today().isoformat():
+        return None
+    if re.search(r'сезон|сери[яий]|S\d{1,2}E\d', title, re.I):
+        return None
+    names = title[:year.start()].strip().split(' / ', 1)
+    if not names[0]:
+        return None
+    return dict(id='', type='movie', name=names[0][:500], original=names[1][:500] if len(names) > 1 else '',
+                releaseInfo=year[1], releaseDate=published, releaseSource=source,
+                poster='', description='', availableQuality=[rank], qualitySummary=LABELS[rank])
+
+
+def title_key(value):
+    return re.sub(r'[^\w]+', ' ', value.casefold().replace('ё', 'е').replace('_', ' ')).strip()
+
+
+def identities(item):
+    result = []
+    for key in ('kpid', 'imdbid', 'tmdbid'):
+        if item.get(key):
+            result.append(key + ':' + str(item[key]))
+    year = str(item.get('releaseInfo', ''))
+    if re.fullmatch(r'\d{4}', year):
+        for key in ('original', 'name'):
+            if item.get(key):
+                result.append('title:' + title_key(item[key]) + '|' + year)
+    return result
+
+
+def conflicts(a, b):
+    return any(a.get(k) and b.get(k) and a[k] != b[k] for k in ('kpid', 'imdbid', 'tmdbid'))
+
+
+def merge(existing, incoming, source):
+    # Independent source files prevent a source switch from mixing two catalogs.
+    films = []
+    for item in existing + incoming:
+        item = dict(item)
+        keys = set(identities(item))
+        if not keys:
+            continue
+        matches = [f for f in films if keys.intersection(identities(f)) and not conflicts(f, item)]
+        if not matches:
+            item['id'] = item.get('id') or 'release:' + hashlib.sha256(next(iter(identities(item))).encode()).hexdigest()[:24]
+            films.append(item)
+            continue
+        target = matches[0]
+        for other in matches[1:] + [item]:
+            for k, v in other.items():
+                if not target.get(k) and v:
+                    target[k] = v
+            target['availableQuality'] = sorted(set(target['availableQuality'] + other['availableQuality']))
+            target['qualitySummary'] = ' · '.join(LABELS[x] for x in target['availableQuality'])
+            target['releaseDate'] = min(target['releaseDate'], other['releaseDate'])
+        for other in matches[1:]:
+            films.remove(other)
+    films.sort(key=lambda x: (x['releaseDate'], x['id']), reverse=True)
+    return dict(schema=1, updated=int(time.time() * 1000), source=source, items=films[:8000],
+                historyComplete=False, historyFrom='')
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # Do not forward a Jackett API key to a different host.
+
+
+def fetch(url, maximum=2 * 1024 * 1024):
+    req = Request(url, headers={'User-Agent': 'Vion-Collector/' + VERSION, 'Accept': 'application/json,text/html'})
+    with build_opener(NoRedirect).open(req, timeout=15) as response:
+        body = response.read(maximum + 1)
+        if len(body) > maximum:
+            raise ValueError('upstream_too_large')
+        charset = response.headers.get_content_charset() or 'utf-8'
+        if charset.lower() not in ('utf-8', 'windows-1251', 'cp1251'):
+            raise ValueError('unsupported_upstream_charset')
+        return body.decode(charset, errors='strict')
+
+
+def listing(body, source='rutor'):
+    start = re.search(r'<div\b[^>]*\bid=[\x22\x27]index[\x22\x27][^>]*>', body, re.I)
+    if not start or '</table>' not in body[start.end():].lower():
+        raise ValueError('unrecognized_rutor_listing')
+    table = re.split(r'</table>', body[start.end():], maxsplit=1, flags=re.I)[0]
+    items = []
+    months = {'янв': 1, 'фев': 2, 'мар': 3, 'апр': 4, 'май': 5, 'июн': 6,
+              'июл': 7, 'авг': 8, 'сен': 9, 'окт': 10, 'ноя': 11, 'дек': 12}
+    for row in re.findall(r'<tr\b[^>]*class=[\x22\x27](?:gai|tum)[\x22\x27][^>]*>(.*?)</tr\s*>', table, re.I | re.S):
+        cell = re.search(r'<td\b[^>]*>(.*?)</td>', row, re.I | re.S)
+        if not cell:
+            raise ValueError('missing_listing_date')
+        value = plain(cell[1]).lower()
+        found = re.search(r'(\d{1,2})\s+([а-я]+)\s+(\d{2,4})', value)
+        try:
+            if found:
+                year = int(found[3]); year += 2000 if year < 100 else 0
+                published = date(year, months[found[2][:3]], int(found[1])).isoformat()
+            else:
+                published = datetime.strptime(value, '%d.%m.%Y').date().isoformat()
+        except (ValueError, KeyError):
+            raise ValueError('unrecognized_listing_date') from None
+        for href, title in re.findall(r'<a\b[^>]*href=[\x22\x27]([^\x22\x27]+)[\x22\x27][^>]*>(.*?)</a>', row, re.I | re.S):
+            if re.fullmatch(r'/torrent/[1-9]\d*(?:/[^?#]*)?', html.unescape(href)):
+                item = item_from_title(title, published, source)
+                if item:
+                    items.append(item)
+                break
+    return items
+
+
+def url_base(value, private_http=False):
+    parsed = urlsplit(value)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError('invalid_upstream_address')
+    if not private_http and parsed.scheme != 'https':
+        raise ValueError('upstream_requires_https')
+    return value.rstrip('/')
+
+
+def collect(config, page=1):
+    source = config['source']
+    if source == 'rutor':
+        base = url_base(config.get('rutor_url', 'https://rutor.info'))
+        rows = []
+        for category in (1, 5):
+            rows += listing(fetch(f'{base}/browse/{page - 1}/{category}/0/0'))
+        return rows
+    base = url_base(config.get('jackett_url', ''), private_http=True)
+    secret = os.environ.get('VION_JACKETT_KEY') or config.get('jackett_key', '')
+    if not secret:
+        raise ValueError('jackett_key_missing')
+    indexer = config.get('indexer', '') or source
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', indexer):
+        raise ValueError('invalid_indexer')
+    params = urlencode(dict(apikey=secret, Query='', Category=2000, Limit=100))
+    response = json.loads(fetch(f'{base}/api/v2.0/indexers/{indexer}/results?{params}'))
+    if response.get('Error') or not isinstance(response.get('Results'), list):
+        raise ValueError('jackett_feed_unavailable')
+    rows = []
+    for raw in response['Results'][:1000]:
+        item = item_from_title(raw.get('Title', ''), raw.get('PublishDate', ''), source)
+        if item:
+            imdb = str(raw.get('Imdb', ''))
+            if imdb.isdigit():
+                imdb = 'tt' + imdb
+            if re.fullmatch(r'tt\d+', imdb):
+                item['imdbid'] = imdb
+            rows.append(item)
+    return rows
+
+
+def config_at(path):
+    config = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    if config.get('source', 'rutor') not in SOURCES:
+        raise ValueError('invalid_source')
+    config.setdefault('source', 'rutor')
+    interval = config.get('interval_minutes', 120)
+    if type(interval) is not int or not 15 <= interval <= 1440:
+        raise ValueError('invalid_interval')
+    config['interval_minutes'] = interval
+    pages = config.get('pages_per_update', 2)
+    if type(pages) is not int or not 1 <= pages <= 10:
+        raise ValueError('invalid_page_budget')
+    return config
+
+
+class Collector:
+    def __init__(self, data, config_path):
+        self.data = Path(data)
+        self.data.mkdir(parents=True, exist_ok=True)
+        self.config_path = Path(config_path)
+        self.lock = threading.Lock()
+        self.update_lock = threading.Lock()
+        self.error = ''
+        keyfile = self.data / 'access-key.txt'
+        try:
+            with keyfile.open('x', encoding='ascii') as out:
+                os.chmod(keyfile, 0o600)
+                out.write(secrets.token_urlsafe(32))
+        except FileExistsError:
+            pass
+        self.key = keyfile.read_text(encoding='ascii').strip()
+        if not re.fullmatch(r'[!-~]{32,512}', self.key):
+            raise ValueError('invalid_access_key')
+
+    def snapshot(self, source=None):
+        source = source or config_at(self.config_path)['source']
+        path = self.data / ('releases-' + source + '.json')
+        with self.lock:
+            if not path.exists():
+                return None
+            if path.stat().st_size > LIMIT:
+                raise ValueError('snapshot_too_large')
+            return json.loads(path.read_text(encoding='utf-8'))
+
+    def update(self):
+        if not self.update_lock.acquire(blocking=False):
+            return False
+        try:
+            config = config_at(self.config_path)
+            incoming = []
+            cursor_path = self.data / ('cursor-' + config['source'] + '.json')
+            cursor = 2
+            if cursor_path.exists():
+                cursor = max(2, min(201, json.loads(cursor_path.read_text())['page']))
+            pages = [1]
+            if config['source'] == 'rutor':
+                pages += list(range(cursor, min(201, cursor + config['pages_per_update'] - 1)))
+            oldest = ''
+            for page in pages:
+                incoming += collect(config, page)
+            if not incoming:
+                raise ValueError('no_qualifying_releases')
+            old = self.snapshot(config['source'])
+            result = merge(old['items'] if old else [], incoming, config['source'])
+            with self.lock:
+                atomic(self.data / ('releases-' + config['source'] + '.json'), result)
+                # Save after the catalog: a crash may repeat a page, never skip it.
+                if config['source'] == 'rutor' and len(pages) > 1:
+                    atomic(cursor_path, dict(page=pages[-1] + 1))
+            self.error = ''
+            return True
+        except Exception as error:
+            # Never log raw HTTP errors: they can contain an API key in the URL.
+            safe = str(error) if isinstance(error, ValueError) and re.fullmatch(r'[a-z_]+', str(error)) else type(error).__name__
+            self.error = safe
+            print('Update failed:', safe, '— saved catalog retained', flush=True)
+            return False
+        finally:
+            self.update_lock.release()
+
+
+def make_server(collector, host, port):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = 'VionCollector/' + VERSION
+        sys_version = ''
+
+        def log_message(self, *args):
+            pass
+
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(10)
+
+        def answer(self, status, value):
+            body = encode(value)
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == '/health':
+                return self.answer(200, dict(service='vion-collector', version=VERSION, schema=1))
+            supplied = self.headers.get('Authorization', '').encode('utf-8')
+            expected = ('Bearer ' + collector.key).encode('ascii')
+            if not hmac.compare_digest(supplied, expected):
+                return self.answer(401, dict(error='unauthorized'))
+            if self.path != '/v1/releases':
+                return self.answer(404, dict(error='not_found'))
+            try:
+                snapshot = collector.snapshot()
+                return self.answer(200, snapshot) if snapshot else self.answer(503, dict(error='catalog_not_ready'))
+            except Exception:
+                return self.answer(503, dict(error='catalog_unavailable'))
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+        def __init__(self, *args):
+            self.slots = threading.BoundedSemaphore(8)
+            super().__init__(*args)
+        def process_request(self, request, address):
+            if not self.slots.acquire(blocking=False):
+                request.close()
+                return
+            try:
+                super().process_request(request, address)
+            except BaseException:
+                self.slots.release()
+                raise
+        def process_request_thread(self, request, address):
+            try:
+                super().process_request_thread(request, address)
+            finally:
+                self.slots.release()
+    return Server((host, port), Handler)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Vion Collector by tomeeli')
+    parser.add_argument('--data', default='data')
+    parser.add_argument('--config', default='config.json')
+    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=8790)
+    parser.add_argument('--once', action='store_true')
+    parser.add_argument('--show-key', action='store_true')
+    args = parser.parse_args()
+    if not Path(args.config).exists():
+        atomic(Path(args.config), dict(source='rutor', interval_minutes=120, pages_per_update=2))
+    config_at(args.config)
+    collector = Collector(args.data, args.config)
+    if args.show_key:
+        print(collector.key)
+        return 0
+    if args.once:
+        return 0 if collector.update() else 1
+    stop = threading.Event()
+    def worker():
+        while not stop.is_set():
+            collector.update()
+            try:
+                delay = config_at(args.config)['interval_minutes'] * 60
+            except Exception:
+                delay = 900
+            stop.wait(delay)
+    server = make_server(collector, args.host, args.port)
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    def shutdown(*_):
+        stop.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+    print(f'Vion Collector {VERSION} by tomeeli — {args.host}:{server.server_port}', flush=True)
+    try:
+        server.serve_forever(poll_interval=0.25)
+    finally:
+        stop.set()
+        server.server_close()
+        thread.join(timeout=2)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

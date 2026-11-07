@@ -1,0 +1,9 @@
+{
+  "source": "rutor",
+  "interval_minutes": 120,
+  "pages_per_update": 2,
+  "rutor_url": "https://rutor.info",
+  "jackett_url": "",
+  "jackett_key": "",
+  "indexer": ""
+}
